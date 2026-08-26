@@ -1,7 +1,6 @@
-.venv/
 data/
+.venv/
 .env
 server.log
 __pycache__/
 *.pyc
-bench_extraction.py

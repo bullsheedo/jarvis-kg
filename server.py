@@ -121,6 +121,103 @@ class IngestReq(BaseModel):
     name: str | None = None
     source: str = "chat"
 
+# ---- voice: local Whisper STT + edge-tts (both free/offline-ish) ----
+import tempfile, shutil as _shutil
+_whisper = None
+def _get_whisper():
+    global _whisper
+    if _whisper is None:
+        from faster_whisper import WhisperModel
+        _whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
+    return _whisper
+
+VOICE_ID = "en-US-AndrewNeural"   # deep JARVIS-y male neural voice
+
+from fastapi import UploadFile, File
+@app.post("/stt")
+async def stt(request: Request, file: UploadFile = File(...)):
+    """WebM/Opus audio from the browser mic -> transcript."""
+    _check_auth(request)
+    tmp_in = tmp_out = None
+    try:
+        data = await file.read()
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+            f.write(data); tmp_in = f.name
+        # browser webm/opus isn't wav — convert via ffmpeg
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_out = f.name
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", tmp_in, "-ar", "16000", "-ac", "1", tmp_out,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        if await proc.wait() != 0 or not Path(tmp_out).exists():
+            raise HTTPException(500, "ffmpeg conversion failed")
+        segments, _info = _get_whisper().transcribe(tmp_out, language="en", beam_size=1)
+        text = " ".join(s.text.strip() for s in segments).strip()
+        return {"text": text}
+    except HTTPException:
+        raise
+    except Exception as ex:
+        raise HTTPException(500, f"{type(ex).__name__}: {ex}")
+    finally:
+        for p in (tmp_in, tmp_out):
+            if p and Path(p).exists(): Path(p).unlink()
+
+class TTSReq(BaseModel):
+    text: str
+@app.post("/tts")
+async def tts(req: TTSReq, request: Request):
+    """Text -> mp3 (edge-tts neural voice). Returns audio/mpeg stream."""
+    _check_auth(request)
+    try:
+        import edge_tts
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp.close()
+        await asyncio.wait_for(
+            edge_tts.Communicate(req.text[:1000], VOICE_ID).save(tmp.name), timeout=25)
+        def _cleanup():
+            try: Path(tmp.name).unlink()
+            except Exception: pass
+        return FileResponse(tmp.name, media_type="audio/mpeg", background=_cleanup)
+    except Exception as ex:
+        raise HTTPException(500, f"{type(ex).__name__}: {ex}")
+
+@app.get("/voice-config")
+async def voice_config():
+    return {"voice": VOICE_ID, "stt": "faster-whisper base.en (local)", "tts": "edge-tts"}
+
+# ---- QR phone pairing (like Mark-LI Remote Control) ----
+@app.get("/pair")
+async def pair(request: Request):
+    """QR code that opens the dashboard on the phone, pre-filled with the key."""
+    _check_auth(request)
+    key = KEY_FILE.read_text().strip()
+    token = TOKEN_FILE.read_text().strip()
+    # auto-login URL: phone scans -> browser opens -> key+token in URL -> instant session
+    url = f"http://{request.headers.get('host','127.0.0.1:8630')}/auto-login?key={key}&t={token}"
+    import qrcode, io, base64
+    img = qrcode.make(url, box_size=8, border=2)
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return {"qr_png_base64": b64, "url": url,
+            "note": "Scan with any phone camera. Android: opens in browser. iPhone camera app: same."}
+
+@app.get("/auto-login", response_class=HTMLResponse)
+async def auto_login(key: str = "", t: str = ""):
+    _ensure_dashboard_creds()
+    if key.strip().upper() == KEY_FILE.read_text().strip() and t == TOKEN_FILE.read_text().strip():
+        # hand the token to the dashboard via a tiny bootstrap page
+        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
+<script>
+sessionStorage.setItem('jarvis_token', {json.dumps(t)});
+location.replace('/');
+</script><p>Linking to JARVIS…</p></body></html>"""
+        return HTMLResponse(html)
+    return HTMLResponse("<h3>Invalid pairing link.</h3>", status_code=401)
+
+@app.get("/pair-page", response_class=HTMLResponse)
+async def pair_page():
+    return FileResponse(Path(__file__).parent / "static" / "pair.html", media_type="text/html")
+
 class SearchReq(BaseModel):
     query: str
     num_results: int = 10

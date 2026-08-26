@@ -94,6 +94,37 @@
     .hint { flex-shrink:0; font-size:10px; color:var(--muted); padding:0 16px 8px; }
     .hint b { color: var(--accent); }
 
+    /* ── MIC + VOICE BUTTONS ── */
+    #mic-btn {
+      background: var(--surface); border: 1px solid var(--border); color: var(--muted);
+      padding: 11px 13px; font-size: 16px; line-height: 1; border-radius: 12px;
+      cursor: pointer; transition: opacity 0.15s, transform 0.1s, background 0.2s;
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    }
+    #mic-btn:hover  { opacity: 0.82; border-color: var(--accent); color: var(--accent); }
+    #mic-btn:active { transform: scale(0.96); }
+    #mic-btn.recording {
+      background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.45); color: #ef4444;
+      animation: mic-pulse 1s ease-in-out infinite;
+    }
+    @keyframes mic-pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.65;transform:scale(0.97)} }
+    #mic-btn.unsupported { opacity: 0.3; cursor: not-allowed; }
+    #spk-btn {
+      background: var(--surface); border: 1px solid var(--border);
+      padding: 11px 13px; font-size: 16px; line-height: 1; border-radius: 12px;
+      cursor: pointer; color: var(--muted); transition: all 0.15s; flex-shrink:0;
+      display:flex; align-items:center; justify-content:center;
+    }
+    #spk-btn.on { color: var(--green); border-color: rgba(34,197,94,0.4); background: var(--gdim); }
+    #spk-btn:hover { opacity:.82 }
+    .hdr-btn {
+      background:var(--surface); border:1px solid var(--border); color:var(--muted);
+      font-size:10px; font-weight:700; letter-spacing:1.5px; padding:5px 11px;
+      border-radius:99px; cursor:pointer; text-decoration:none; text-transform:uppercase;
+      transition:all .2s;
+    }
+    .hdr-btn:hover { border-color:var(--accent); color:var(--accent); }
+
     /* ── TOAST ── */
     #toast {
       position:fixed; top:66px; left:50%; transform:translateX(-50%) translateY(-8px);
@@ -113,6 +144,8 @@
     <div class="pill" id="pill"><span class="dot"></span><span id="st">Connecting</span></div>
     <div class="spacer"></div>
     <div class="url" id="stats">…</div>
+    <a class="hdr-btn" href="/pair-page" title="Pair your phone via QR">📱 PHONE</a>
+    <button id="spk-btn" onclick="toggleVoice()" title="JARVIS voice replies">🔊</button>
     <div class="url" id="model">ox-alpha</div>
   </header>
 
@@ -128,6 +161,7 @@
   <div class="hint">Type to chat &amp; ingest — every exchange becomes graph memory · prefix <b>remember:</b> to store a fact only</div>
   <footer>
     <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
+    <button id="mic-btn" onclick="doMic()" title="Voice — tap to speak">🎤</button>
     <button class="btn btn-send" onclick="doSend()">SEND</button>
   </footer>
 
@@ -243,10 +277,113 @@ function showFacts(facts){
   : '(no relevant memories yet)';
 }
 
-// ── Chat ────────────────────────────────────────────────────────────────────
-async function doSend(){
- const inp=document.getElementById('inp'),txt=inp.value.trim();if(!txt)return;
- inp.value='';
+// ── Voice: TTS speaker toggle ───────────────────────────────────────────────
+let _voiceOn = localStorage.getItem('jarvis_voice') === '1';
+const spkBtn = document.getElementById('spk-btn');
+function _spkUi(){ spkBtn.classList.toggle('on',_voiceOn); spkBtn.textContent=_voiceOn?'🔊':'🔇';
+ spkBtn.title=_voiceOn?'JARVIS speaks replies (ON)':'JARVIS speaks replies (OFF)'; }
+function toggleVoice(){ _voiceOn=!_voiceOn; localStorage.setItem('jarvis_voice',_voiceOn?'1':'0');
+ _spkUi(); toast(_voiceOn?'Voice replies ON':'Voice replies OFF'); }
+_spkUi();
+
+let _lastSpoken = '';
+async function speak(text){
+ if(!_voiceOn || !text) return;
+ // strip markdown noise so it reads clean
+ const clean = text.replace(/[*_`#>|]/g,'').replace(/\n+/g,'. ').slice(0,600);
+ if(clean===_lastSpoken) return; _lastSpoken=clean;
+ try{
+  const r=await fetch(API+'/tts',{method:'POST',headers:{'Content-Type':'application/json',
+    body:JSON.stringify({text:clean})}});
+  if(!r.ok) return;
+  const blob=await r.blob(); const url=URL.createObjectURL(blob);
+  const a=new Audio(url);
+  a.onended=()=>URL.revokeObjectURL(url);
+  await a.play();
+ }catch(e){/* audio blocked until user gesture — normal on first load */}
+}
+
+// ── Mic: record + silence auto-stop + STT ───────────────────────────────────
+const micBtn=document.getElementById('mic-btn');
+let _mediaRec=null,_chunks=[],_silenceTimer=null,_stream=null,_analyser=null,_audioCtx=null;
+const SILENCE_MS=1600, SILENCE_THRESH=0.012;
+
+function _micState(state){
+ micBtn.classList.toggle('recording',state==='rec');
+ micBtn.innerHTML=state==='rec'?'⏺':'🎤';
+ micBtn.title=state==='rec'?'Listening… stops after silence. Tap to stop.':'Voice — tap to speak';
+}
+function _unsupported(){micBtn.classList.add('unsupported');micBtn.title='Mic unsupported in this browser';}
+
+async function doMic(){
+ try{
+  if(_mediaRec && _mediaRec.state==='recording'){ _stopMic(); return; }
+  if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder){_unsupported();return;}
+  _stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
+  _audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  const src=_audioCtx.createMediaStreamSource(_stream);
+  _analyser=_audioCtx.createAnalyser(); _analyser.fftSize=512; src.connect(_analyser);
+  _chunks=[];
+  const mime=MediaRecorder.isTypeSupported('audio/webm;codecs=opus')?'audio/webm;codecs=opus':'audio/webm';
+  _mediaRec=new MediaRecorder(_stream,{mimeType:mime});
+  _mediaRec.ondataavailable=e=>{if(e.data.size)_chunks.push(e.data)};
+  _mediaRec.onstop=()=>_processRecording();
+  _mediaRec.start(100);
+  _micState('rec'); setStatus(true,'Listening…');
+  _armSilenceWatch();
+ }catch(err){
+  append('sys','⚠ Microphone unavailable: '+err.name+'. Serve over http://127.0.0.1 (works) or https.');
+  toast('Mic error: '+err.name);
+ }
+}
+function _stopMic(){
+ clearTimeout(_silenceTimer);
+ try{if(_mediaRec&&_mediaRec.state!=='inactive')_mediaRec.stop()}catch{}
+ if(_stream){_stream.getTracks().forEach(t=>t.stop());_stream=null;}
+ if(_audioCtx){try{_audioCtx.close()}catch{} _audioCtx=null;}
+}
+// bulletproof auto-stop: 1.6s of near-silence ends recording automatically
+function _armSilenceWatch(){
+ let quietSince=null;
+ const buf=new Float32Array(_analyser.fftSize);
+ const check=()=>{
+  if(!_mediaRec||_mediaRec.state!=='recording')return;
+  _analyser.getFloatTimeDomainData(buf);
+  let peak=0; for(let i=0;i<buf.length;i++){const v=Math.abs(buf[i]);if(v>peak)peak=v;}
+  const now=Date.now();
+  if(peak<SILENCE_THRESH){ if(!quietSince)quietSince=now;
+    if(now-quietSince>=SILENCE_MS && now-_recStart>1200){_stopMic();return;} }
+  else quietSince=null;
+  _silenceTimer=setTimeout(check,80);
+ };
+ var _recStart=Date.now();
+ check();
+}
+async function _processRecording(){
+ _micState('idle'); setStatus(true,'Active');
+ const blob=new Blob(_chunks,{type:'audio/webm'});
+ _chunks=[];
+ if(blob.size<2000)return; // too short — ignore
+ const d=append('jarvis','');
+ d.innerHTML='<div class="lbl">Jarvis</div><span class="typing"><i></i><i></i><i></i></span>'+
+   '<span style="font-size:11px;color:var(--muted)"> transcribing…</span>';
+ try{
+  const fd=new FormData(); fd.append('file',blob,'speech.webm');
+  const st=await _authFetch(API+'/stt',{method:'POST',body:fd}).then(_authed).then(r=>r.json());
+  d.remove();
+  const text=(st.text||'').trim();
+  if(!text){append('sys','— didn\'t catch that — tap 🎤 and speak closer to the mic —');return;}
+  addUserAndRun(text);
+ }catch(e){ d.remove(); append('sys','Transcription failed: '+e.message); }
+}
+
+// ── Chat core (shared by typed & spoken input) ──────────────────────────────
+function showFacts(facts){
+ document.getElementById('factsbar').innerHTML=facts.length
+  ? facts.map(f=>`<div class="factcard">${esc(f.fact)}${f.invalid_at?' <sup>SUPERSEDED</sup>':''}</div>`).join('')
+  : '(no relevant memories yet)';
+}
+async function addUserAndRun(txt){
  append('user',txt);
  const remember=txt.toLowerCase().startsWith('remember:');
  try{
@@ -269,10 +406,15 @@ async function doSend(){
     d.innerHTML='<div class="lbl">Jarvis</div>'+esc(buf);feed.scrollTop=feed.scrollHeight;}
    showFacts(await _authFetch(API+'/search',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({query:txt,num_results:6})}).then(r=>r.json()).then(r=>r.results));
+   speak(buf); // 🔊 talk back
    fetch(API+'/ingest',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({text:`User said: ${txt}`,source:'chat'})}).then(()=>loadStats());
   }
  }catch(e){append('jarvis','Core offline: '+e);}
+}
+async function doSend(){
+ const inp=document.getElementById('inp'),txt=inp.value.trim();if(!txt)return;
+ inp.value=''; addUserAndRun(txt);
 }
 document.getElementById('inp').addEventListener('keydown',e=>{
  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend();}
