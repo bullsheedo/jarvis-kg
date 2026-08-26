@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS — Knowledge Core</title>
+<style>
+:root{--cy:#00e5ff;--am:#ffb300;--bg:#04080f;--pane:rgba(6,16,30,.78);--line:#0e3350}
+*{margin:0;box-sizing:border-box}
+body{background:radial-gradient(ellipse at 50% 120%,#0a1a2f 0%,var(--bg) 60%);
+ font-family:'Segoe UI',system-ui,sans-serif;color:#cfefff;height:100vh;display:flex;
+ flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:14px;padding:10px 22px;border-bottom:1px solid var(--line);
+ background:linear-gradient(180deg,rgba(10,25,45,.9),transparent)}
+#reactor{width:34px;height:34px;border-radius:50%;position:relative;
+ background:radial-gradient(circle,#fff 0 18%,var(--cy) 30%,transparent 65%);
+ animation:pulse 2.4s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 8px var(--cy)}50%{box-shadow:0 0 26px var(--cy)}}
+h1{font-size:17px;letter-spacing:5px;font-weight:600;color:var(--cy)}
+h1 small{color:#4d7ea8;letter-spacing:2px;font-size:11px;margin-left:10px}
+#stats{margin-left:auto;font-family:'Cascadia Code',monospace;font-size:12px;color:var(--am)}
+main{flex:1;display:flex;min-height:0}
+#graphwrap{flex:1;position:relative;cursor:grab}
+#graphwrap.dragging{cursor:grabbing}
+canvas{width:100%;height:100%;display:block}
+#tooltip{position:absolute;pointer-events:none;background:#081527ee;border:1px solid var(--cy);
+ color:#dff6ff;padding:8px 10px;border-radius:6px;font-size:12px;max-width:280px;display:none;
+ box-shadow:0 0 14px rgba(0,229,255,.3);z-index:5;line-height:1.4}
+aside{width:430px;border-left:1px solid var(--line);display:flex;flex-direction:column;background:var(--pane)}
+#chat{flex:1;overflow-y:auto;padding:14px}
+#chat::-webkit-scrollbar,#facts::-webkit-scrollbar{width:6px}
+#chat::-webkit-scrollbar-thumb,#facts::-webkit-scrollbar-thumb{background:#14456b;border-radius:3px}
+.msg{margin-bottom:12px;line-height:1.5;white-space:pre-wrap;animation:fadein .25s}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+.msg.user{color:#fff}.msg .tag{font-size:10px;color:var(--cy);letter-spacing:2px}
+.msg.jarvis{color:#9fd8ef;background:rgba(0,229,255,.04);border-left:2px solid var(--cy);
+ padding:8px 10px;border-radius:0 8px 8px 0}
+.facts{border-top:1px solid var(--line);padding:10px 14px;font-size:11.5px;color:#7fb3cc;
+ max-height:150px;overflow-y:auto}
+.facts b{color:var(--am)}
+.factcard{background:rgba(255,179,0,.06);border-left:2px solid var(--am);padding:4px 8px;
+ margin:4px 0;border-radius:0 6px 6px 0}
+.hint{padding:6px 14px;font-size:10.5px;color:#446e88}
+.row{display:flex;padding:10px;border-top:1px solid var(--line);gap:8px}
+input[type=text]{flex:1;background:#081527;border:1px solid #14456b;color:#dff6ff;
+ padding:10px 12px;border-radius:6px;font-size:14px;outline:none;transition:border .2s}
+input[type=text]:focus{border-color:var(--cy);box-shadow:0 0 8px rgba(0,229,255,.35)}
+button{background:#0a2a44;color:var(--cy);border:1px solid var(--cy);padding:9px 16px;
+ border-radius:6px;cursor:pointer;font-size:13px;letter-spacing:1px;transition:.15s}
+button:hover{background:var(--cy);color:#03202e;box-shadow:0 0 12px rgba(0,229,255,.5)}
+.typing{display:inline-flex;gap:4px;padding:4px 0}
+.typing i{width:6px;height:6px;border-radius:50%;background:var(--cy);animation:blink 1.2s infinite}
+.typing i:nth-child(2){animation-delay:.2s}.typing i:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+</style>
+</head>
+<body>
+<header><div id="reactor"></div>
+ <h1>J A R V I S<small>KNOWLEDGE CORE // temporal graph online</small></h1>
+ <div id="stats">loading…</div></header>
+<main>
+ <div id="graphwrap"><canvas id="cv"></canvas><div id="tooltip"></div></div>
+ <aside>
+  <div id="chat"></div>
+  <div class="facts" id="facts">Graph memory facts used in the last answer will appear here.</div>
+  <div class="hint">Type to chat & ingest · prefix <b style="color:var(--cy)">remember:</b> to only store a fact · drag the graph to pan</div>
+  <div class="row"><input id="in" type="text" placeholder="Speak, sir." autocomplete="off">
+   <button onclick="send()">SEND</button></div>
+ </aside>
+</main>
+<script>
+const API="";
+// ---------- graph physics (pan + hover + labels) ----------
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+const wrap=document.getElementById('graphwrap'),tip=document.getElementById('tooltip');
+let nodes=[],links=[],N={},pan={x:0,y:0},drag=null,mouse={x:-999,y:-999};
+function resize(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=cv.clientHeight*devicePixelRatio;}
+addEventListener('resize',resize);resize();
+wrap.addEventListener('mousedown',e=>{drag={x:e.clientX-pan.x,y:e.clientY-pan.y};wrap.classList.add('dragging')});
+addEventListener('mouseup',()=>{drag=null;wrap.classList.remove('dragging')});
+addEventListener('mousemove',e=>{
+ const r=cv.getBoundingClientRect();
+ mouse.x=e.clientX-r.left;mouse.y=e.clientY-r.top;
+ if(drag){pan.x=e.clientX-drag.x;pan.y=e.clientY-drag.y;}
+});
+async function loadStats(){try{
+ const [s,g]=await Promise.all([fetch(API+'/stats').then(r=>r.json()),fetch(API+'/graph?limit=200').then(r=>r.json())]);
+ document.getElementById('stats').textContent=`ENTITIES ${s.Entity||0} · EDGES ${s.RELATES_TO||0} · EPISODES ${s.Episodic||0}`;
+ const old=N;
+ nodes=g.nodes.map(n=>({...n,x:(Math.random()-.5)*400,y:(Math.random()-.5)*400,vx:0,vy:0}));
+ if(old[n.id]&&old[n.id]){}
+ nodes.forEach(n=>{if(old[n.id]){n.x=old[n.id].x;n.y=old[n.id].y;}N[n.id]=n;});
+ links=g.edges.filter(e=>N[e.source]&&N[e.target]);
+}catch(e){document.getElementById('stats').textContent='OFFLINE';}}
+function tick(){
+ for(const n of nodes){
+  n.vx*=.85;n.vy*=.85;
+  n.x+=n.vx+((Math.random()-.5)*.1);n.y+=n.vy+((Math.random()-.5)*.1);
+ }
+ for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
+  const a=nodes[i],b=nodes[j];let dx=a.x-b.x,dy=a.y-b.y,d=Math.hypot(dx,dy)||1;
+  if(d<160){const f=(160-d)/d*.02;a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f;}
+ }
+ for(const l of links){const a=N[l.source],b=N[l.target];
+  let dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||1,f=(d-140)/d*.005;
+  a.vx+=dx*f;a.vy+=dy*f;b.vx-=dx*f;b.vy-=dy*f;}
+ for(const n of nodes){n.vx-=n.x*.0004;n.vy-=n.y*.0004;}
+}
+function draw(){
+ ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+ ctx.clearRect(0,0,cv.width,cv.height);
+ const w=cv.clientWidth,h=cv.clientHeight;
+ ctx.save();ctx.translate(w/2+pan.x,h/2+pan.y);ctx.scale(.55+Math.min(w,h)/2200,.55+Math.min(w,h)/2200);
+ // grid rings
+ ctx.strokeStyle='rgba(0,120,180,.15)';
+ const cx0=-pan.x,cy0=-pan.y;
+ for(let r=90;r<Math.max(w,h)*1.5;r+=110){ctx.beginPath();ctx.arc(cx0,cy0,r,0,7);ctx.stroke();}
+ let hovered=null;
+ for(const l of links){const a=N[l.source],b=N[l.target];
+  // hit-test edges near mouse
+  ctx.strokeStyle='rgba(0,229,255,.28)';ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+  const mx=(mouse.x-w/2-pan.x)/(.55+Math.min(w,h)/2200),my=(mouse.y-h/2-pan.y)/(.55+Math.min(w,h)/2200);
+  const dx=b.x-a.x,dy=b.y-a.y,len2=dx*dx+dy*dy||1;
+  const t=Math.max(0,Math.min(1,((mx-a.x)*dx+(my-a.y)*dy)/len2));
+  const px=a.x+t*dx,py=a.y+t*dy;
+  if(Math.hypot(mx-px,my-py)<8)hovered=l;
+ }
+ for(const n of nodes){
+  const mx=(mouse.x-w/2-pan.x)/(.55+Math.min(w,h)/2200),my=(mouse.y-h/2-pan.y)/(.55+Math.min(w,h)/2200);
+  const over=Math.hypot(mx-n.x,my-n.y)<12;
+  if(over)hovered={node:n};
+  ctx.fillStyle=over?'#ffd54f':'#ffb300';ctx.shadowColor='#ffb300';ctx.shadowBlur=over?16:8;
+  ctx.beginPath();ctx.arc(n.x,n.y,over?6:4,0,7);ctx.fill();ctx.shadowBlur=0;
+  ctx.fillStyle=over?'#ffe082':'#cfefff';ctx.font=(over?'bold ':'')+'10px monospace';
+  ctx.fillText(n.name.slice(0,20),n.x+7,n.y-5);}
+ ctx.restore();
+ // tooltip
+ if(hovered){
+  tip.style.display='block';tip.style.left=(mouse.x+14)+'px';tip.style.top=(mouse.y+10)+'px';
+  tip.innerHTML=hovered.node
+    ?`<b style="color:var(--am)">${hovered.node.name}</b><br>entity`
+    :`<b style="color:var(--cy)">${hovered.label}</b>`;
+ }else tip.style.display='none';
+ requestAnimationFrame(()=>{tick();draw();});
+}
+loadStats().then(draw);
+setInterval(loadStats,8000);
+// ---------- chat ----------
+const chatEl=document.getElementById('chat');
+function add(cls,text,tag){const d=document.createElement('div');d.className='msg '+cls;
+ d.innerHTML=(tag?`<span class="tag">${tag}</span><br>`:'')+(text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+ chatEl.appendChild(d);chatEl.scrollTop=1e9;return d;}
+add('jarvis','Good to have you back, sir. Knowledge core is synchronised.','JARVIS');
+function showFacts(facts){
+ document.getElementById('facts').innerHTML=facts.length
+  ? facts.map(f=>`<div class="factcard">• ${f.fact}${f.invalid_at?' <span style="color:#e57373">(superseded)</span>':''}</div>`).join('')
+  : '(no relevant memories yet)';
+}
+async function send(){
+ const v=document.getElementById('in').value.trim();if(!v)return;
+ document.getElementById('in').value='';
+ add('user',v,'YOU');
+ const remember=v.toLowerCase().startsWith('remember:');
+ try{
+  if(remember){
+   const r=await fetch(API+'/ingest',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:v.slice(9),source:'manual'})}).then(r=>r.json());
+   if(r.ok){const f=r.facts_added.map(f=>`• ${f.fact}`).join('<br>')||'(no new facts extracted)';
+    add('jarvis','Committed to memory:<br>'+f,'GRAPH INGEST');loadStats();}
+   else add('jarvis','Ingest failed: '+(r.detail||'?'),'ERROR');
+  }else{
+   const d=add('jarvis','<span class="typing"><i></i><i></i><i></i></span>','JARVIS');let buf='';
+   const res=await fetch(API+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message:v})});
+   const reader=res.body.getReader(),dec=new TextDecoder();
+   while(true){const {done,value}=await reader.read();if(done)break;
+    buf+=dec.decode(value,{stream:true});d.innerHTML='<span class="tag">JARVIS</span><br>'+
+     buf.replace(/&/g,'&amp;').replace(/</g,'&lt;');chatEl.scrollTop=1e9;}
+   showFacts(await fetch(API+'/search',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({query:v,num_results:6})}).then(r=>r.json()).then(r=>r.results));
+   fetch(API+'/ingest',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:`User said: ${v}`,source:'chat'})}).then(()=>loadStats());
+  }
+ }catch(e){add('jarvis','Core offline: '+e,'ERROR');}
+}
+document.getElementById('in').addEventListener('keydown',e=>{if(e.key==='Enter')send()});
+</script>
+</body>
+</html>
