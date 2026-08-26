@@ -6,9 +6,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 
@@ -83,6 +83,39 @@ async def lifespan(app):
 app = FastAPI(title="JARVIS KG", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ---- dashboard auth (Mark-LI style: 6-char session key -> bearer token) ----
+import secrets as _secrets
+DATA_DIR = Path(DB_PATH).parent
+KEY_FILE = DATA_DIR / "dashboard.key"
+TOKEN_FILE = DATA_DIR / "dashboard.token"
+
+def _ensure_dashboard_creds():
+    if not KEY_FILE.exists():
+        key = _secrets.token_hex(3).upper()[:6]  # 6 hex chars
+        token = _secrets.token_urlsafe(32)
+        KEY_FILE.write_text(key)
+        TOKEN_FILE.write_text(token)
+        os.chmod(KEY_FILE, 0o600); os.chmod(TOKEN_FILE, 0o600)
+
+def _check_auth(req: Request):
+    token = (req.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    if not token or token != TOKEN_FILE.read_text().strip():
+        raise HTTPException(401, "unauthorized")
+
+class LoginReq(BaseModel):
+    key: str
+
+@app.post("/login")
+async def login(req: LoginReq):
+    _ensure_dashboard_creds()
+    if req.key.strip().upper() == KEY_FILE.read_text().strip():
+        return {"token": TOKEN_FILE.read_text().strip()}
+    raise HTTPException(401, "invalid key")
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return FileResponse(Path(__file__).parent / "static" / "login.html", media_type="text/html")
+
 class IngestReq(BaseModel):
     text: str
     name: str | None = None
@@ -106,7 +139,8 @@ def node_dto(n: EntityNode) -> dict:
             "labels": getattr(n, "labels", [])}
 
 @app.post("/ingest")
-async def ingest(req: IngestReq):
+async def ingest(req: IngestReq, request: Request):
+    _check_auth(request)
     t0 = datetime.datetime.now(datetime.UTC)
     try:
         res = await graphiti.add_episode(
@@ -122,7 +156,8 @@ async def ingest(req: IngestReq):
         raise HTTPException(500, f"{type(ex).__name__}: {ex}")
 
 @app.post("/search")
-async def search(req: SearchReq):
+async def search(req: SearchReq, request: Request):
+    _check_auth(request)
     try:
         edges = await graphiti.search(req.query, num_results=req.num_results)
         for uuid, name in await q("MATCH (n:Entity) RETURN n.uuid AS uuid, n.name AS name"):
@@ -137,7 +172,8 @@ async def q(query: str):
     return [tuple(r[h] for h in header) for r in records or []]
 
 @app.get("/stats")
-async def stats():
+async def stats(request: Request):
+    _check_auth(request)
     out = {}
     try:
         out["Entity"] = (await q("MATCH (n:Entity) RETURN count(n) AS c"))[0][0]
@@ -148,7 +184,8 @@ async def stats():
     return out
 
 @app.get("/graph")
-async def graph(limit: int = 200):
+async def graph(request: Request, limit: int = 200):
+    _check_auth(request)
     """Nodes+edges snapshot for the HUD visualization."""
     nodes, edges, seen = [], [], set()
     try:
@@ -177,8 +214,9 @@ class ChatReq(BaseModel):
     message: str
 
 @app.post("/chat")
-async def chat(req: ChatReq):
-    facts = (await search(SearchReq(query=req.message, num_results=6)))["results"]
+async def chat(req: ChatReq, request: Request):
+    _check_auth(request)
+    facts = (await search(SearchReq(query=req.message, num_results=6), request))["results"]
     memory = "\n".join(f"- {f['fact']}" for f in facts) or "(no relevant memories yet)"
     sys_prompt = ("You are JARVIS, a precise AI assistant. Use this temporal knowledge-graph "
                   "memory when relevant (respect validity — invalid_at means superseded):\n" + memory)
